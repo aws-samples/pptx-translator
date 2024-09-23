@@ -5,8 +5,10 @@
 import argparse
 
 import boto3
+import json
 
 from botocore.exceptions import ClientError
+from botocore.config import Config
 from pptx import Presentation
 from pptx.enum.lang import MSO_LANGUAGE_ID
 
@@ -78,11 +80,62 @@ python-pptx doesn't support:
 
 TERMINOLOGY_NAME = 'pptx-translator-terminology'
 
+CONFIG = Config(
+   retries = {
+      'max_attempts': 10,
+      'mode': 'standard'
+   }
+)
 
-translate = boto3.client(service_name='translate')
+
+translate = boto3.client(service_name='translate', config=CONFIG)
+bedrock = boto3.client(service_name='bedrock-runtime', config=CONFIG)
+
+def bedrock_translate(text, source_language_code, target_language_code):
+    print('.', end='')
+    prompt = f"""
+Human: 
+Translate [Text] into [Language]. Understand the meaning of [text] and find relevant 
+words that best suite a PowerPoint presentation. Respond with the translated text only.
+
+Language = {target_language_code}
+Text= {text}
 
 
-def translate_presentation(presentation, source_language_code, target_language_code, terminology_names):
+Assistant:
+Here is the translated text:
+"""
+    body=json.dumps(
+        {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1000,
+            "temperature": 0.0,
+            "system": "You are a expert translator fluent in multiple language",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ]
+        }  
+    )
+
+    response = bedrock.invoke_model(
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+        body=body
+    )
+    
+    response_body = json.loads(response.get('body').read())
+    translated_text = response_body["content"][0]["text"]
+    return translated_text
+
+
+def translate_presentation(presentation, source_language_code, target_language_code, terminology_names, use_bedrock=False):
     slide_number = 1
     for slide in presentation.slides:
         print('Slide {slide_number} of {number_of_slides}'.format(
@@ -95,18 +148,23 @@ def translate_presentation(presentation, source_language_code, target_language_c
             text_frame = slide.notes_slide.notes_text_frame
             if len(text_frame.text) > 0:
                 try:
-                    response = translate.translate_text(
-                            Text=text_frame.text,
-                            SourceLanguageCode=source_language_code,
-                            TargetLanguageCode=target_language_code,
-                            TerminologyNames=terminology_names)
-                    slide.notes_slide.notes_text_frame.text = response.get('TranslatedText')
+                    if use_bedrock:
+                        translated_text = bedrock_translate(text_frame.text, source_language_code, target_language_code)
+                        slide.notes_slide.notes_text_frame.text = translated_text
+                    else:
+                        response = translate.translate_text(
+                                Text=text_frame.text,
+                                SourceLanguageCode=source_language_code,
+                                TargetLanguageCode=target_language_code,
+                                TerminologyNames=terminology_names)
+                        slide.notes_slide.notes_text_frame.text = response.get('TranslatedText')
                 except ClientError as client_error:
                     if (client_error.response['Error']['Code'] == 'ValidationException'):
                         # Text not valid. Maybe the size of the text exceeds the size limit of the service.
                         # Amazon Translate limits: https://docs.aws.amazon.com/translate/latest/dg/what-is-limits.html
                         # We just ignore and don't translate the text.
                         print('Invalid text. Ignoring...')
+                        print(json.dumps(client_error.response))
 
         # translate other texts
         for shape in slide.shapes:
@@ -115,12 +173,16 @@ def translate_presentation(presentation, source_language_code, target_language_c
             for paragraph in shape.text_frame.paragraphs:
                 for index, paragraph_run in enumerate(paragraph.runs):
                     try:
-                        response = translate.translate_text(
-                                Text=paragraph_run.text,
-                                SourceLanguageCode=source_language_code,
-                                TargetLanguageCode=target_language_code,
-                                TerminologyNames=terminology_names)
-                        paragraph.runs[index].text = response.get('TranslatedText')
+                        if use_bedrock:
+                            translated_text = bedrock_translate(paragraph_run.text, source_language_code, target_language_code)
+                            paragraph.runs[index].text = translated_text
+                        else:
+                            response = translate.translate_text(
+                                    Text=paragraph_run.text,
+                                    SourceLanguageCode=source_language_code,
+                                    TargetLanguageCode=target_language_code,
+                                    TerminologyNames=terminology_names)
+                            paragraph.runs[index].text = response.get('TranslatedText')
                         paragraph.runs[index].font.language_id = LANGUAGE_CODE_TO_LANGUAGE_ID[target_language_code]
                     except ClientError as client_error:
                         if (client_error.response['Error']['Code'] == 'ValidationException'):
@@ -128,6 +190,9 @@ def translate_presentation(presentation, source_language_code, target_language_c
                             # Amazon Translate limits: https://docs.aws.amazon.com/translate/latest/dg/what-is-limits.html
                             # We just ignore and don't translate the text.
                             print('Invalid text. Ignoring...')
+                        print(json.dumps(client_error.response))
+                        exit(1)
+                        
 
 
 def import_terminology(terminology_file_path):
@@ -153,6 +218,9 @@ def main():
     argument_parser.add_argument(
             '--terminology', type=str,
             help='The path of the terminology CSV file')
+    argument_parser.add_argument(
+            '--use-bedrock', action='store_true',
+            help='Use Bedrock-based translation with Claude Sonet model')
     args = argument_parser.parse_args()
 
     terminology_names = []
@@ -168,7 +236,8 @@ def main():
     translate_presentation(presentation,
                            args.source_language_code,
                            args.target_language_code,
-                           terminology_names)
+                           terminology_names,
+                           args.use_bedrock)
 
     output_file_path = args.input_file_path.replace(
             '.pptx', '-{language_code}.pptx'.format(language_code=args.target_language_code))
