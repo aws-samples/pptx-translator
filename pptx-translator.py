@@ -128,19 +128,22 @@ def translate_presentation(presentation, source_language_code, target_language_c
                 translated_slide_content += translated_text + "\n"
 
         # Handle notes
-        if not slide.has_notes_slide:
-            slide.notes_slide = slide.add_notes_slide()
-        
-        notes_slide = slide.notes_slide
-        notes_text = notes_slide.notes_text_frame.text.strip()
+        if slide.has_notes_slide:
+            notes_slide = slide.notes_slide
+            notes_text = notes_slide.notes_text_frame.text.strip()
 
-        if overwrite_notes or (add_missing_notes and not notes_text):
-            # Generate new notes based on translated content
+            if overwrite_notes or (add_missing_notes and not notes_text):
+                # Generate new notes based on translated content
+                generated_notes = generate_notes(translated_slide_content, target_language_code)
+                notes_slide.notes_text_frame.text = generated_notes
+            elif notes_text:
+                # Just translate existing notes
+                translate_text_frame(notes_slide.notes_text_frame, source_language_code, target_language_code, terminology_names)
+        elif add_missing_notes:
+            # No existing notes, but add_missing_notes is set
+            notes_slide = presentation.notes_master.notes_layout.clone_layout_placeholder(slide)
             generated_notes = generate_notes(translated_slide_content, target_language_code)
             notes_slide.notes_text_frame.text = generated_notes
-        elif notes_text:
-            # Just translate existing notes
-            translate_text_frame(notes_slide.notes_text_frame, source_language_code, target_language_code, terminology_names)
 
     print("Translation and note generation completed.")
 
