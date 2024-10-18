@@ -1,11 +1,22 @@
 import argparse
 import boto3
-import json
 from botocore.exceptions import ClientError
 from pptx import Presentation
 from pptx.enum.lang import MSO_LANGUAGE_ID
 
 LANGUAGE_CODE_TO_LANGUAGE_ID = {
+"""
+Dict that maps Amazon Translate language code to MSO_LANGUAGE_ID enum value.
+
+- Amazon Translate language codes: https://docs.aws.amazon.com/translate/latest/dg/what-is.html#what-is-languages
+- python-pptx MSO_LANGUAGE_ID enum: https://python-pptx.readthedocs.io/en/latest/api/enum/MsoLanguageId.html
+
+python-pptx doesn't support:
+    - Azerbaijani (az)
+    - Persian (fa)
+    - Dari (fa-AF)
+    - Tagalog (tl)
+"""
     'af': MSO_LANGUAGE_ID.AFRIKAANS,
     'am': MSO_LANGUAGE_ID.AMHARIC,
     'ar': MSO_LANGUAGE_ID.ARABIC,
@@ -61,108 +72,38 @@ LANGUAGE_CODE_TO_LANGUAGE_ID = {
 TERMINOLOGY_NAME = 'pptx-translator-terminology'
 
 translate = boto3.client(service_name='translate')
-bedrock = boto3.client(service_name='bedrock-runtime')
 
-def generate_notes(slide_content, target_language_code):
-    target_language_id = LANGUAGE_CODE_TO_LANGUAGE_ID.get(target_language_code, 'en')
-
-    prompt = f"""Given the following slide content, generate concise and informative speaker notes. Provide the complete output in {target_language_id}.
-
-Slide Content:
-{slide_content}
-
-Please provide your response in the following format, in {target_language_id}:
-
-- [List 2-3 key points from the slide]
-
-[2-3 sentences expanding on the key points, providing context or additional information]
-
-Note: If {target_language_id} uses a non-Latin script, please provide the response in that script."""
-
-    body = json.dumps(
-        {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 2048,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": ""
-                }
-            ],
-        }
-    )
-
-    try:
-        response = bedrock.invoke_model(
-            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0", body=body
-        )
-        response_body = json.loads(response["body"].read())
-        return response_body["content"][0]["text"].strip()
-    except Exception as e:
-        print(f"Error generating notes: {str(e)}")
-        return ""
-
-def translate_presentation(presentation, source_language_code, target_language_code, terminology_names, overwrite_notes, add_missing_notes):
-    slide_number = 1
-    for slide in presentation.slides:
-        print(f'Slide {slide_number} of {len(presentation.slides)}')
-        slide_number += 1
-
-        # Translate slide content and collect translated text
-        translated_slide_content = ""
+def translate_presentation(presentation, source_language_code, target_language_code, terminology_names):
+    for slide_index, slide in enumerate(presentation.slides, start=1):
+        print(f'Slide {slide_index} of {len(presentation.slides)}')
+        
         for shape in slide.shapes:
             if shape.has_table:
                 for row in shape.table.rows:
                     for cell in row.cells:
-                        translated_text = translate_text_frame(cell.text_frame, source_language_code, target_language_code, terminology_names)
-                        translated_slide_content += translated_text + " | "
-                    translated_slide_content += "\n"
+                        translate_text_frame(cell.text_frame, source_language_code, target_language_code, terminology_names)
             elif shape.has_text_frame:
-                translated_text = translate_text_frame(shape.text_frame, source_language_code, target_language_code, terminology_names)
-                translated_slide_content += translated_text + "\n"
-
-        # Handle notes
+                translate_text_frame(shape.text_frame, source_language_code, target_language_code, terminology_names)
+        
         if slide.has_notes_slide:
-            notes_slide = slide.notes_slide
-            notes_text = notes_slide.notes_text_frame.text.strip()
-
-            if overwrite_notes or (add_missing_notes and not notes_text):
-                # Generate new notes based on translated content
-                generated_notes = generate_notes(translated_slide_content, target_language_code)
-                notes_slide.notes_text_frame.text = generated_notes
-            elif notes_text:
-                # Just translate existing notes
-                translate_text_frame(notes_slide.notes_text_frame, source_language_code, target_language_code, terminology_names)
-        elif add_missing_notes:
-            # No existing notes, but add_missing_notes is set
-            notes_slide = presentation.notes_master.notes_layout.clone_layout_placeholder(slide)
-            generated_notes = generate_notes(translated_slide_content, target_language_code)
-            notes_slide.notes_text_frame.text = generated_notes
-
-    print("Translation and note generation completed.")
+            translate_text_frame(slide.notes_slide.notes_text_frame, source_language_code, target_language_code, terminology_names)
 
 def translate_text_frame(text_frame, source_language_code, target_language_code, terminology_names):
-    translated_text = ""
     for paragraph in text_frame.paragraphs:
         for run in paragraph.runs:
-            try:
-                response = translate.translate_text(
-                    Text=run.text,
-                    SourceLanguageCode=source_language_code,
-                    TargetLanguageCode=target_language_code,
-                    TerminologyNames=terminology_names)
-                run.text = response.get('TranslatedText')
-                translated_text += run.text + " "
-            except ClientError as client_error:
-                if client_error.response['Error']['Code'] == 'ValidationException':
-                    print('Invalid text. Ignoring...')
-    return translated_text.strip()
+            if run.text.strip():
+                try:
+                    response = translate.translate_text(
+                        Text=run.text,
+                        SourceLanguageCode=source_language_code,
+                        TargetLanguageCode=target_language_code,
+                        TerminologyNames=terminology_names
+                    )
+                    # original text if translation fails
+                    run.text = response.get('TranslatedText', run.text)  
+                except ClientError as client_error:
+                    if client_error.response['Error']['Code'] == 'ValidationException':
+                        print('Invalid text. Ignoring...')
 
 def import_terminology(terminology_file_path):
     print(f'Importing terminology data from {terminology_file_path}...')
@@ -186,15 +127,7 @@ def main():
     argument_parser.add_argument(
             '--terminology', type=str,
             help='The path of the terminology CSV file')
-    argument_parser.add_argument(
-            '--overwrite-notes', action='store_true',
-            help='Generate notes for all slides, overwriting existing notes')
-    argument_parser.add_argument(
-            '--add-missing-notes', action='store_true',
-            help='Generate notes only for slides without existing notes')
     args = argument_parser.parse_args()
-
-    print(args)
 
     terminology_names = []
     if args.terminology:
@@ -206,9 +139,7 @@ def main():
     translate_presentation(presentation,
                            args.source_language_code,
                            args.target_language_code,
-                           terminology_names,
-                           args.overwrite_notes,
-                           args.add_missing_notes)
+                           terminology_names)
 
     output_file_path = args.input_file_path.replace(
             '.pptx', f'-{args.target_language_code}.pptx')
